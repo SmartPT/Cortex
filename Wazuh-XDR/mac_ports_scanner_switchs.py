@@ -16,7 +16,10 @@ SWITCH_LIST = "switches.txt"   # File with one IP per line
 SSH_USER = os.getenv("SSH_USER", "")
 SSH_PASS = os.getenv("SSH_PASS", "")
 SSH_PORT = 22
-OUTPUT_CSV = "mac_ports_access_only.csv"
+
+# Keep this path aligned with your takedown script:
+# /var/ossec/active-response/bin/cisco/mac_ports_with_switch.csv
+OUTPUT_CSV = "/var/ossec/active-response/bin/cisco/mac_ports_with_switch.csv"
 
 # Commands (Cisco IOS/IOS-XE style)
 SHOW_MAC_CMD = "show mac address-table"
@@ -37,6 +40,17 @@ def ssh_run_command(host: str, command: str) -> str:
     finally:
         client.close()
 
+# ── Helpers ────────────────────────────────────────────────────────────────
+def format_mac(mac_raw: str) -> str | None:
+    """
+    Normalize any MAC (aa:bb:cc:dd:ee:ff, aabb.ccdd.eeff, AABB-CCDD-EEFF, etc.)
+    into Cisco dotted lowercase: xxxx.xxxx.xxxx. Return None if not 12 hex chars.
+    """
+    mac_hex = re.sub(r'[^0-9A-Fa-f]', '', mac_raw).lower()
+    if len(mac_hex) != 12:
+        return None
+    return f"{mac_hex[:4]}.{mac_hex[4:8]}.{mac_hex[8:12]}"
+
 # ── Parsing helpers ────────────────────────────────────────────────────────
 def parse_trunk_ports(trunk_output: str) -> set[str]:
     """
@@ -47,7 +61,7 @@ def parse_trunk_ports(trunk_output: str) -> set[str]:
     for line in trunk_output.splitlines():
         line = line.strip()
         # Lines with: <Port> <Mode> <Encapsulation> <Status> ...
-        # We capture the first column when Status contains 'trunking'
+        # Capture the first column when Status contains 'trunking'
         m = re.match(r"^(\S+)\s+\S+\s+\S+\s+trunking\b", line, flags=re.IGNORECASE)
         if m:
             trunks.add(m.group(1))
@@ -71,7 +85,7 @@ def parse_portchannel_members(ec_summary_output: str) -> dict[str, set[str]]:
         for tok in line.split():
             # Strip trailing role marks like (P), (D), (H)
             t = re.sub(r"\([A-Za-z]+\)$", "", tok)
-            if re.match(r"^(Gi|Fa|Te|Hu|Et)\d+([/\.]\d+){0,3}$", t):  # flexible enough for Gi1/0/1, Te0/0/0, etc.
+            if re.match(r"^(Gi|Fa|Te|Hu|Et)\d+([/\.]\d+){0,3}$", t):
                 members.add(t)
         if members:
             mapping[po_name] = members
@@ -81,23 +95,34 @@ def parse_mac_output(output: str, switch_ip: str, excluded_ports: set[str]):
     """
     Parses Cisco-style 'show mac address-table' and filters out entries learned
     on trunk or port-channel/member ports listed in excluded_ports.
+    Ensures MACs are written in xxxx.xxxx.xxxx (lowercase) format.
     """
     results = []
     for line in output.splitlines():
-        # Typical line: "  10   0011.2233.4455   DYNAMIC   Gi1/0/1"
-        # Also skip lines that show the CPU or Router as the port.
-        m = re.search(r"\b([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}|[0-9a-fA-F]{12})\b.*\b([A-Za-z]+[0-9/\.]+)\b", line)
+        # Typical IOS line: "  10   0011.2233.4455   DYNAMIC   Gi1/0/1"
+        # Allow various MAC formats; capture port from last column token.
+        m = re.search(
+            r"\b([0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}|[0-9A-Fa-f]{12}|[0-9A-Fa-f]{2}(?:[:\-\.][0-9A-Fa-f]{2}){5})\b.*\b([A-Za-z]+[\d/\.]+)\b",
+            line
+        )
         if not m:
             continue
-        mac = m.group(1).lower()
-        port = m.group(2)
 
-        # Ignore non-physical "ports" like CPU/Router
-        if port.upper() in {"CPU", "ROUTER"}:
+        mac_fmt = format_mac(m.group(1))
+        if not mac_fmt:
             continue
 
-        if port not in excluded_ports:
-            results.append((mac, port, switch_ip))
+        port = m.group(2)
+
+        # Ignore non-physical "ports" like CPU/ROUTER and any excluded (trunks/Po members)
+        if port.upper() in {"CPU", "ROUTER"}:
+            continue
+        if port in excluded_ports:
+            continue
+
+        # Keep it consistent with the block script expectations
+        results.append((mac_fmt, port, switch_ip))
+
     return results
 
 def build_excluded_ports(host: str) -> set[str]:
@@ -136,10 +161,12 @@ def collect_mac_port_data(switch_ips: list[str]) -> list[tuple[str, str, str]]:
     return all_data
 
 def save_to_csv(data: list[tuple[str, str, str]], filename: str):
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["MAC Address", "Port", "Switch IP"])
-        writer.writerows(sorted(set(data)))  # de-dup + sort for readability
+        # de-dup + sort for readability
+        writer.writerows(sorted(set(data)))
 
 def main():
     switch_ips = read_switch_list(SWITCH_LIST)
